@@ -51,6 +51,15 @@ CONVO_MIN_GAP = float(os.environ.get("CONVO_MIN_GAP", "4"))
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "14"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "120"))
+# «режим мнения»: когда у Жеки прямо спрашивают, что он думает — берём больше
+# контекста и даём ответить развёрнутее (анализирует обсуждение)
+OPINION_CONTEXT = int(os.environ.get("OPINION_CONTEXT", "25"))
+OPINION_MAX_TOKENS = int(os.environ.get("OPINION_MAX_TOKENS", "280"))
+OPINION_TRIGGERS = [s.strip().lower() for s in os.environ.get(
+    "OPINION_TRIGGERS",
+    "что думаешь,чё думаешь,че думаешь,как думаешь,твоё мнение,твое мнение,как считаешь,"
+    "что скажешь,а ты как,а ты что,а ты чё,как тебе такое,что думаете,а ты чё молчишь,"
+    "а ты че молчишь,ты согласен,а по-твоему").split(",") if s.strip()]
 TYPING_MAX_SEC = float(os.environ.get("TYPING_MAX_SEC", "3.0"))
 
 # эмодзи, которые Telegram принимает как реакции (setMessageReaction).
@@ -214,21 +223,30 @@ def decide(state, addressed, text):
     return (random.random() < p), False
 
 
-def build_reply(state, forced):
-    """Зовём Haiku с маленьким окном контекста. None — если сказать нечего."""
+def build_reply(state, forced, opinion=False):
+    """Зовём Haiku. opinion=True → анализ обсуждения, больше контекста и длиннее ответ."""
     if anthropic is None:
         log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
         return None
 
-    recent = list(state.messages)[-CONTEXT_WINDOW:]
+    window = OPINION_CONTEXT if opinion else CONTEXT_WINDOW
+    recent = list(state.messages)[-window:]
     history = recent[:-1]
     last = recent[-1] if recent else {"name": "", "text": ""}
     transcript = "\n".join(f"{m['name']}: {m['text']}" for m in history) or "(пока пусто)"
 
-    instr = ("Ответь как " + BOT_NAME + " именно на ПОСЛЕДНЕЕ сообщение, с учётом контекста выше. "
-             "Если там вопрос — ответь на него по сути (в своём стиле, можно с приколом), "
-             "не уходи в свою тему и не отмахивайся. Коротко. Можно текст, или реакция "
-             "[react:🔥] в начале, или и то и другое.")
+    if opinion:
+        instr = ("Тебя спросили мнение / просят влиться в обсуждение. Прочитай переписку выше "
+                 "и дай свой РЕАЛЬНЫЙ, осмысленный взгляд по сути — со своим отношением, в своём "
+                 "стиле (дерзко, с приколом — ок, но по делу). Можно развернуться на 2-4 фразы, "
+                 "без воды и без списков. Опирайся на то, что реально обсуждали.")
+        maxtok = OPINION_MAX_TOKENS
+    else:
+        instr = ("Ответь как " + BOT_NAME + " именно на ПОСЛЕДНЕЕ сообщение, с учётом контекста выше. "
+                 "Если там вопрос — ответь на него по сути (в своём стиле, можно с приколом), "
+                 "не уходи в свою тему и не отмахивайся. Коротко. Можно текст, или реакция "
+                 "[react:🔥] в начале, или и то и другое.")
+        maxtok = MAX_TOKENS
     if forced:
         instr += " Тебя позвали лично — обязательно ответь по делу, не пиши SKIP."
     else:
@@ -239,7 +257,7 @@ def build_reply(state, forced):
     try:
         resp = anthropic.messages.create(
             model=MODEL,
-            max_tokens=MAX_TOKENS,
+            max_tokens=maxtok,
             system=PERSONA,
             messages=[{"role": "user", "content": user}],
         )
@@ -283,7 +301,8 @@ def handle_update(update):
     if not ok:
         return
 
-    raw = build_reply(state, forced)
+    opinion = any(t in text.lower() for t in OPINION_TRIGGERS)
+    raw = build_reply(state, forced, opinion)
     if not raw:
         return
 

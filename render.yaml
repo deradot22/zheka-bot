@@ -40,3 +40,7 @@ services:
         value: "14"
       - key: MAX_TOKENS
         value: "120"
+      - key: OPINION_CONTEXT
+        value: "25"
+      - key: OPINION_MAX_TOKENS
+        value: "280"
