@@ -182,7 +182,7 @@ def _sb_headers():
 
 
 def _mem_load(chat_id):
-    d = {"emojis": {}, "phrases": {}}
+    d = {"emojis": {}, "phrases": {}, "facts": []}
     if not USE_SUPABASE:
         return d
     try:
@@ -192,6 +192,7 @@ def _mem_load(chat_id):
             got = r.json()[0].get("data") or {}
             d["emojis"] = got.get("emojis", {}) or {}
             d["phrases"] = got.get("phrases", {}) or {}
+            d["facts"] = got.get("facts", []) or []
         elif not r.ok:
             log.warning("memory load %s: %s", r.status_code, r.text[:150])
     except Exception:
@@ -242,16 +243,52 @@ def learn(chat_id, text):
 
 
 def memory_hint(chat_id):
-    """Подсказка для модели: любимые эмодзи и мемы чата."""
+    """Подсказка для модели: запомненные факты + любимые эмодзи и мемы чата."""
     m = _mem(chat_id)
     te = sorted(m["emojis"].items(), key=lambda x: -x[1])[:TOP_EMOJIS]
     tp = [(p, c) for p, c in sorted(m["phrases"].items(), key=lambda x: -x[1]) if c >= 2][:TOP_PHRASES]
+    facts = m.get("facts", [])
     parts = []
+    if facts:
+        parts.append("Что ты ПОМНИШЬ (факты/правила — учитывай и применяй):\n"
+                     + "\n".join("- " + f for f in facts[-40:]))
     if te:
         parts.append("Эмодзи, которые любит этот чат: " + " ".join(e for e, _ in te))
     if tp:
         parts.append("Местные фразочки/мемы чата: " + ", ".join("«%s»" % p for p, _ in tp))
     return "\n".join(parts)
+
+
+def add_fact(chat_id, fact):
+    """Сохранить факт/правило в долгую память (с дедупом и лимитом)."""
+    fact = fact.strip().strip("«»\"'").strip()
+    if not fact or len(fact) > 200:
+        return False
+    m = _mem(chat_id)
+    facts = m.setdefault("facts", [])
+    if any(fact.lower() == f.lower() for f in facts):
+        return False
+    facts.append(fact)
+    del facts[:-80]  # держим максимум 80 фактов
+    _mem_save(chat_id)
+    log.info("MEMO chat=%s: %s", chat_id, fact[:80])
+    return True
+
+
+def forget_facts(chat_id, query):
+    """Удалить из памяти факты, содержащие query."""
+    q = query.strip().lower()
+    if not q:
+        return 0
+    m = _mem(chat_id)
+    facts = m.setdefault("facts", [])
+    before = len(facts)
+    m["facts"] = [f for f in facts if q not in f.lower()]
+    removed = before - len(m["facts"])
+    if removed:
+        _mem_save(chat_id)
+        log.info("FORGET chat=%s: %d removed by %r", chat_id, removed, query[:60])
+    return removed
 
 
 def ensure_identity():
@@ -341,8 +378,8 @@ def decide(state, addressed, text, reply_to_other=False):
     return (random.random() < p), False, False
 
 
-def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx=""):
-    """Зовём Haiku. opinion — анализ обсуждения; hint — стиль/эмодзи/мемы; judge — модель решает, к ней ли; reply_ctx — на какое сообщение сделан reply."""
+def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx="", remember=False, forget=False):
+    """Зовём Haiku. opinion — анализ; hint — стиль/память; judge — к ней ли; reply_ctx — reply-таргет; remember/forget — записать/стереть факт через MEMO/FORGET."""
     if anthropic is None:
         log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
         return None
@@ -373,6 +410,14 @@ def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx=""
         instr += (" СНАЧАЛА определи, адресовано ли ПОСЛЕДНЕЕ сообщение именно тебе (Гене) "
                   "или другому участнику (по контексту, именам и никам вроде «паша», «серёга», «миша»). "
                   "Если обращаются НЕ к тебе — ответь ровно SKIP и больше ничего.")
+    instr += (" Если всплыл важный устойчивый факт/правило о ком-то или о тебе, который стоит "
+              "запомнить НАДОЛГО — добавь В САМОМ КОНЦЕ ответа отдельной строкой "
+              "`MEMO: <короткий факт одним предложением>` (только если правда важно; обычно не нужно).")
+    if remember:
+        instr += (" Тебя ПРЯМО просят запомнить — обязательно добавь строку "
+                  "`MEMO: <что именно запомнить, кратко и ясно>` и подтверди в своём стиле.")
+    if forget:
+        instr += " Тебя просят забыть — добавь строку `FORGET: <ключевые слова, что забыть>`."
 
     last_line = f"{last['name']}: {last['text']}"
     if reply_ctx:
@@ -439,8 +484,22 @@ def handle_update(update):
     if not ok:
         return
 
-    opinion = any(t in text.lower() for t in OPINION_TRIGGERS)
-    raw = build_reply(state, forced, opinion, memory_hint(chat_id), judge, reply_ctx)
+    low_text = text.lower()
+    opinion = any(t in low_text for t in OPINION_TRIGGERS)
+    remember = any(w in low_text for w in ("запомни", "запиши", "имей в виду", "имей ввиду", "на будущее"))
+    forget = any(w in low_text for w in ("забудь", "удали из памяти"))
+    raw = build_reply(state, forced, opinion, memory_hint(chat_id), judge, reply_ctx, remember, forget)
+    if not raw:
+        return
+
+    # долгая память: вынимаем MEMO/FORGET, сохраняем, убираем эти строки из текста
+    for fact in re.findall(r'(?im)^\s*MEMO:\s*(.+?)\s*$', raw):
+        add_fact(chat_id, fact)
+    for q in re.findall(r'(?im)^\s*FORGET:\s*(.+?)\s*$', raw):
+        forget_facts(chat_id, q)
+    raw = re.sub(r'(?im)^\s*(?:MEMO|FORGET):.*$', '', raw).strip()
+    if not raw and (remember or forget):
+        raw = "ок, запомнил" if remember else "ок, забыл"
     if not raw:
         return
 
