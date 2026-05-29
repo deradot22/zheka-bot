@@ -38,7 +38,7 @@ ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
 BOT_NAME = os.environ.get("BOT_NAME", "Жека")
 NAME_TRIGGERS = [s.strip().lower() for s in os.environ.get("NAME_TRIGGERS", "жека,жек,жэка,zheka").split(",") if s.strip()]
 
-CHATTINESS = float(os.environ.get("CHATTINESS", "0.20"))
+CHATTINESS = float(os.environ.get("CHATTINESS", "0.15"))
 QUESTION_BOOST = float(os.environ.get("QUESTION_BOOST", "0.15"))
 REPLY_COOLDOWN_SEC = float(os.environ.get("REPLY_COOLDOWN_SEC", "45"))
 MAX_REPLIES_PER_HOUR = int(os.environ.get("MAX_REPLIES_PER_HOUR", "30"))
