@@ -43,6 +43,10 @@ QUESTION_BOOST = float(os.environ.get("QUESTION_BOOST", "0.15"))
 REPLY_COOLDOWN_SEC = float(os.environ.get("REPLY_COOLDOWN_SEC", "45"))
 MAX_REPLIES_PER_HOUR = int(os.environ.get("MAX_REPLIES_PER_HOUR", "30"))
 MAX_REPLIES_PER_DAY = int(os.environ.get("MAX_REPLIES_PER_DAY", "250"))
+# режим активной беседы: после ответа Жека N секунд «в диалоге» и держит нить
+CONVO_WINDOW_SEC = float(os.environ.get("CONVO_WINDOW_SEC", "120"))
+CONVO_CHATTINESS = float(os.environ.get("CONVO_CHATTINESS", "0.85"))
+CONVO_MIN_GAP = float(os.environ.get("CONVO_MIN_GAP", "4"))
 
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "14"))
@@ -156,6 +160,7 @@ class ChatState:
         self.messages = deque(maxlen=40)   # {"name", "text"}
         self.last_reply = 0.0
         self.reply_times = deque()          # таймстемпы отправленных реплик
+        self.convo_until = 0.0              # до этого времени бот «в активной беседе»
 
 
 STATES = {}
@@ -177,7 +182,8 @@ def is_addressed(msg, text):
 
 
 def decide(state, addressed, text):
-    """Решаем, отвечать ли. Возвращает (отвечать, позвали_лично)."""
+    """Отвечать ли. Возвращает (отвечать, в_контексте).
+    в_контексте=True → прямое обращение или активная беседа: ответить по сути, не SKIP."""
     now = time.time()
     while state.reply_times and now - state.reply_times[0] > 86400:
         state.reply_times.popleft()
@@ -187,9 +193,18 @@ def decide(state, addressed, text):
     if replies_day >= MAX_REPLIES_PER_DAY:
         return False, False
 
+    # прямое обращение (имя / @ / реплай на бота) — всегда отвечаем
     if addressed:
-        return True, True  # прямое обращение — игнорим кулдаун и часовой лимит
+        return True, True
 
+    # активная беседа: Жека недавно говорил → значит с ним общаются, держим нить
+    # и отвечаем почти на всё в контексте, мимо обычного кулдауна
+    if now < state.convo_until:
+        if now - state.last_reply < CONVO_MIN_GAP:
+            return False, False
+        return (random.random() < CONVO_CHATTINESS), True
+
+    # фоновое встревание в чужой разговор — изредка и случайно
     if now - state.last_reply < REPLY_COOLDOWN_SEC:
         return False, False
     if replies_hour >= MAX_REPLIES_PER_HOUR:
@@ -298,6 +313,7 @@ def handle_update(update):
     state.messages.append({"name": BOT_NAME, "text": text or f"(реакция {react})"})
     state.last_reply = now
     state.reply_times.append(now)
+    state.convo_until = now + CONVO_WINDOW_SEC  # открыли/продлили активную беседу
     log.info("engaged (forced=%s) chat=%s react=%s text=%r", forced, chat_id, react, text[:60])
 
 

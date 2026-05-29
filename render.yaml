@@ -30,6 +30,10 @@ services:
         value: "30"
       - key: MAX_REPLIES_PER_DAY
         value: "250"
+      - key: CONVO_WINDOW_SEC
+        value: "120"
+      - key: CONVO_CHATTINESS
+        value: "0.85"
       - key: MODEL
         value: "claude-haiku-4-5"
       - key: CONTEXT_WINDOW
