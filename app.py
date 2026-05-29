@@ -305,7 +305,7 @@ def looks_directed(text):
     return False
 
 
-def decide(state, addressed, text):
+def decide(state, addressed, text, reply_to_other=False):
     """Отвечать ли. Возвращает (отвечать, в_контексте).
     в_контексте=True → прямое обращение или активная беседа: ответить по сути, не SKIP."""
     now = time.time()
@@ -324,8 +324,12 @@ def decide(state, addressed, text):
     # активная беседа: Жека недавно говорил → значит с ним общаются, держим нить
     # и отвечаем почти на всё в контексте, мимо обычного кулдауна
     if now < state.convo_until:
-        if looks_directed(text):
-            return True, True  # в активной беседе к нему явно обращаются («ты…») — отвечаем
+        # «ты…» считаем обращением к НЕМУ, только если: это не реплай другому
+        # и голос Гены свежий в треде (он среди последних ~3 сообщений) —
+        # иначе «ты», скорее всего, адресовано другому участнику (Паше и т.п.)
+        bot_recent = BOT_NAME in [m["name"] for m in list(state.messages)[-4:-1]]
+        if looks_directed(text) and not reply_to_other and bot_recent:
+            return True, True
         if now - state.last_reply < CONVO_MIN_GAP:
             return False, False
         return (random.random() < CONVO_CHATTINESS), True
@@ -418,7 +422,9 @@ def handle_update(update):
     learn(chat_id, text)  # копим эмодзи/фразочки даже когда молчим
 
     addressed = is_addressed(msg, text)
-    ok, forced = decide(state, addressed, text)
+    rt = msg.get("reply_to_message") or {}
+    reply_to_other = bool(rt) and (rt.get("from") or {}).get("id") != BOT_ID
+    ok, forced = decide(state, addressed, text, reply_to_other)
     if not ok:
         return
 
