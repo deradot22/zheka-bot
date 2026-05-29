@@ -341,8 +341,8 @@ def decide(state, addressed, text, reply_to_other=False):
     return (random.random() < p), False, False
 
 
-def build_reply(state, forced, opinion=False, hint="", judge=False):
-    """Зовём Haiku. opinion=True → анализ обсуждения; hint — стиль/эмодзи/мемы; judge=True → модель сама решает, к ней ли обращались."""
+def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx=""):
+    """Зовём Haiku. opinion — анализ обсуждения; hint — стиль/эмодзи/мемы; judge — модель решает, к ней ли; reply_ctx — на какое сообщение сделан reply."""
     if anthropic is None:
         log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
         return None
@@ -374,8 +374,11 @@ def build_reply(state, forced, opinion=False, hint="", judge=False):
                   "или другому участнику (по контексту, именам и никам вроде «паша», «серёга», «миша»). "
                   "Если обращаются НЕ к тебе — ответь ровно SKIP и больше ничего.")
 
+    last_line = f"{last['name']}: {last['text']}"
+    if reply_ctx:
+        last_line += f"\n(↳ это ОТВЕТ (reply) на сообщение — {reply_ctx})"
     user = (f"История чата (контекст):\n{transcript}\n\n"
-            f"ПОСЛЕДНЕЕ сообщение, на него и отвечай:\n{last['name']}: {last['text']}\n\n{instr}")
+            f"ПОСЛЕДНЕЕ сообщение, на него и отвечай:\n{last_line}\n\n{instr}")
     if hint:
         user += ("\n\nПодсказка по стилю ЭТОГО чата (вплетай естественно, когда в тему, "
                  "не насильно):\n" + hint)
@@ -425,12 +428,19 @@ def handle_update(update):
     addressed = is_addressed(msg, text)
     rt = msg.get("reply_to_message") or {}
     reply_to_other = bool(rt) and (rt.get("from") or {}).get("id") != BOT_ID
+    reply_ctx = ""
+    if rt:
+        rf = rt.get("from") or {}
+        rname = BOT_NAME if rf.get("id") == BOT_ID else (rf.get("first_name") or rf.get("username") or "кто-то")
+        rtext = (rt.get("text") or rt.get("caption") or "").strip()
+        if rtext:
+            reply_ctx = f"{rname}: {rtext[:200]}"
     ok, forced, judge = decide(state, addressed, text, reply_to_other)
     if not ok:
         return
 
     opinion = any(t in text.lower() for t in OPINION_TRIGGERS)
-    raw = build_reply(state, forced, opinion, memory_hint(chat_id), judge)
+    raw = build_reply(state, forced, opinion, memory_hint(chat_id), judge, reply_ctx)
     if not raw:
         return
 
