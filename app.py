@@ -292,6 +292,19 @@ def is_addressed(msg, text):
     return False
 
 
+_DIRECTED_WORDS = ("ты", "тебя", "тебе", "тобой", "твой", "твоя", "твоё", "твое",
+                   "твои", "твоего", "твоей", "твоих", "твоим", "твоём", "твоем")
+
+
+def looks_directed(text):
+    """Похоже, что сообщение адресовано собеседнику (2-е лицо: «ты/тебе/твой…»)."""
+    low = text.lower()
+    for w in _DIRECTED_WORDS:
+        if re.search(r"(?<![0-9a-zа-яё])" + w + r"(?![0-9a-zа-яё])", low):
+            return True
+    return False
+
+
 def decide(state, addressed, text):
     """Отвечать ли. Возвращает (отвечать, в_контексте).
     в_контексте=True → прямое обращение или активная беседа: ответить по сути, не SKIP."""
@@ -311,6 +324,8 @@ def decide(state, addressed, text):
     # активная беседа: Жека недавно говорил → значит с ним общаются, держим нить
     # и отвечаем почти на всё в контексте, мимо обычного кулдауна
     if now < state.convo_until:
+        if looks_directed(text):
+            return True, True  # в активной беседе к нему явно обращаются («ты…») — отвечаем
         if now - state.last_reply < CONVO_MIN_GAP:
             return False, False
         return (random.random() < CONVO_CHATTINESS), True
