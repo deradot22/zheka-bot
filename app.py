@@ -358,15 +358,15 @@ def decide(state, addressed, text, reply_to_other=False):
     if replies_day >= MAX_REPLIES_PER_DAY:
         return False, False, False
 
-    # прямое обращение (имя / @ / реплай на бота) — всегда отвечаем
+    # прямое обращение по имени Гены / реплай на бота — точно ему
     if addressed:
         return True, True, False
 
-    # активная беседа: Гена недавно говорил → значит с ним общаются, держим нить
+    # «ты…» без имени Гены и не реплай другому — адресат неясен → пусть решит модель (judge)
+    directed = looks_directed(text) and not reply_to_other
+
     if now < state.convo_until:
-        bot_recent = BOT_NAME in [m["name"] for m in list(state.messages)[-4:-1]]
-        if looks_directed(text) and not reply_to_other and bot_recent:
-            # «ты» может быть к нему или к другому (Паше) — пусть модель решит сама
+        if directed:
             return True, False, True
         if now - state.last_reply < CONVO_MIN_GAP:
             return False, False, False
@@ -379,7 +379,9 @@ def decide(state, addressed, text, reply_to_other=False):
         return False, False, False
 
     p = CHATTINESS + (QUESTION_BOOST if "?" in text else 0.0)
-    return (random.random() < p), False, False
+    if random.random() < p:
+        return True, False, directed  # если на «ты» — модель проверит, к ней ли
+    return False, False, False
 
 
 def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx="", remember=False, forget=False):
@@ -411,9 +413,20 @@ def build_reply(state, forced, opinion=False, hint="", judge=False, reply_ctx=""
     else:
         instr += " Если по сути нечего сказать и реакция не просится — ответь ровно SKIP."
     if judge:
-        instr += (" СНАЧАЛА определи, адресовано ли ПОСЛЕДНЕЕ сообщение именно тебе (Гене) "
-                  "или другому участнику (по контексту, именам и никам вроде «паша», «серёга», «миша»). "
-                  "Если обращаются НЕ к тебе — ответь ровно SKIP и больше ничего.")
+        seen, others = set(), []
+        for mm in reversed(list(state.messages)):
+            nm = mm.get("name", "")
+            if nm and nm != BOT_NAME and nm.lower() not in seen:
+                seen.add(nm.lower())
+                others.append(nm)
+            if len(others) >= 8:
+                break
+        roster = ", ".join(others) if others else "(других не видно)"
+        instr += (f" В чате есть участники: {roster}; ты — {BOT_NAME}. СНАЧАЛА пойми, К КОМУ обращено "
+                  "ПОСЛЕДНЕЕ сообщение: если по имени/нику/контексту оно адресовано другому участнику "
+                  "(например начинается с «Серёг», «Паш», «Миш», «Алин» или там прямо назван другой) — "
+                  f"это НЕ тебе, ответь ровно SKIP и больше ничего. Отвечай, только если обращаются к тебе "
+                  f"({BOT_NAME}) или вопрос явно общий и к тебе тоже.")
     instr += (" Если всплыл важный устойчивый факт/правило о ком-то или о тебе, который стоит "
               "запомнить НАДОЛГО — добавь В САМОМ КОНЦЕ ответа отдельной строкой "
               "`MEMO: <короткий факт одним предложением>` (только если правда важно; обычно не нужно).")
