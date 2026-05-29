@@ -21,7 +21,7 @@ services:
       - key: NAME_TRIGGERS
         value: "жека,жек,жэка,zheka"
       - key: CHATTINESS
-        value: "0.20"
+        value: "0.50"
       - key: QUESTION_BOOST
         value: "0.15"
       - key: REPLY_COOLDOWN_SEC
