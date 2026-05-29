@@ -45,8 +45,8 @@ MAX_REPLIES_PER_HOUR = int(os.environ.get("MAX_REPLIES_PER_HOUR", "30"))
 MAX_REPLIES_PER_DAY = int(os.environ.get("MAX_REPLIES_PER_DAY", "250"))
 # режим активной беседы: после ответа Жека N секунд «в диалоге» и держит нить
 CONVO_WINDOW_SEC = float(os.environ.get("CONVO_WINDOW_SEC", "120"))
-CONVO_CHATTINESS = float(os.environ.get("CONVO_CHATTINESS", "0.85"))
-CONVO_MIN_GAP = float(os.environ.get("CONVO_MIN_GAP", "4"))
+CONVO_CHATTINESS = float(os.environ.get("CONVO_CHATTINESS", "0.5"))
+CONVO_MIN_GAP = float(os.environ.get("CONVO_MIN_GAP", "12"))
 
 MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
 CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "14"))

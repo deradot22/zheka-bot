@@ -23,9 +23,9 @@ services:
       - key: WEBHOOK_SECRET
         generateValue: true
       - key: BOT_NAME
-        value: "Жека"
+        value: "Гена"
       - key: NAME_TRIGGERS
-        value: "жека,жек,жэка,zheka"
+        value: "гена,ген,генка,геныч,gena"
       - key: CHATTINESS
         value: "0.50"
       - key: QUESTION_BOOST
@@ -39,7 +39,9 @@ services:
       - key: CONVO_WINDOW_SEC
         value: "120"
       - key: CONVO_CHATTINESS
-        value: "0.85"
+        value: "0.5"
+      - key: CONVO_MIN_GAP
+        value: "12"
       - key: MODEL
         value: "claude-haiku-4-5"
       - key: CONTEXT_WINDOW
