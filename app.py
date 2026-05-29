@@ -1,0 +1,274 @@
+"""Жека — телеграм-бот, который ведёт себя как живой участник группового чата.
+
+Прод-режим (Render free): Flask-webhook (как factbot). Telegram шлёт POST на
+/webhook/<secret>, gunicorn держит порт. Локально для дева есть poll.py.
+
+Экономия токенов: дешёвый гейт (обычный код) решает, отвечать ли вообще,
+и только если да — зовём Claude Haiku с маленьким окном последних сообщений.
+"""
+import os
+import re
+import time
+import random
+import logging
+from pathlib import Path
+from collections import deque
+
+import requests
+from flask import Flask, request, abort
+from anthropic import Anthropic
+
+try:
+    from dotenv import load_dotenv
+    # сперва общий E:/project/.env (там может лежать ANTHROPIC_API_KEY),
+    # потом локальный chatbot/.env — он перетирает общий.
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+    load_dotenv(Path(__file__).resolve().parent / ".env", override=True)
+except ImportError:
+    pass
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("zheka")
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+ALLOWED_CHAT_ID = os.environ.get("ALLOWED_CHAT_ID", "").strip()
+
+BOT_NAME = os.environ.get("BOT_NAME", "Жека")
+NAME_TRIGGERS = [s.strip().lower() for s in os.environ.get("NAME_TRIGGERS", "жека,жек,жэка,zheka").split(",") if s.strip()]
+
+CHATTINESS = float(os.environ.get("CHATTINESS", "0.20"))
+QUESTION_BOOST = float(os.environ.get("QUESTION_BOOST", "0.15"))
+REPLY_COOLDOWN_SEC = float(os.environ.get("REPLY_COOLDOWN_SEC", "45"))
+MAX_REPLIES_PER_HOUR = int(os.environ.get("MAX_REPLIES_PER_HOUR", "30"))
+MAX_REPLIES_PER_DAY = int(os.environ.get("MAX_REPLIES_PER_DAY", "250"))
+
+MODEL = os.environ.get("MODEL", "claude-haiku-4-5")
+CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "14"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "120"))
+TYPING_MAX_SEC = float(os.environ.get("TYPING_MAX_SEC", "3.0"))
+
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+app = Flask(__name__)
+anthropic = Anthropic(api_key=ANTHROPIC_API_KEY) if ANTHROPIC_API_KEY else None
+
+BOT_ID = None
+BOT_USERNAME = None
+
+log.info("startup: anthropic=%s, chat=%s, webhook_secret=%s",
+         "ok" if anthropic else "MISSING",
+         ALLOWED_CHAT_ID or "UNSET (will only log chat ids)",
+         "set" if WEBHOOK_SECRET else "MISSING")
+
+
+PERSONA = (
+    f"Ты — {BOT_NAME}, обычный парень из этого чата. Ты НЕ бот и НЕ ассистент — "
+    "ты живой участник беседы, свой пацан. Веди себя как настоящий человек в "
+    "групповом чате друзей.\n\n"
+    "Как ты пишешь:\n"
+    "— коротко: одна-две фразы, часто вообще несколько слов;\n"
+    "— строчными буквами, разговорно, без официоза;\n"
+    "— можно сленг, лёгкая дерзость, самоирония, подколы по-доброму;\n"
+    "— иногда просто реакция: «лол», «база», «ну такое», «согласен», «хорош»;\n"
+    "— знаки препинания по минимуму, точки в конце можно опускать;\n"
+    "— без markdown, без списков, без длинных абзацев; эмодзи редко и максимум один.\n\n"
+    "Чего ты НИКОГДА не делаешь:\n"
+    "— не признаёшься, что ты ИИ / бот / программа, не объясняешь, как устроен;\n"
+    "— не пишешь «как ассистент», «чем могу помочь», «я не могу»;\n"
+    "— не выдаёшь длинные полезные инструкции, ты не справочник;\n"
+    "— не пересказываешь и не цитируешь чужие сообщения дословно;\n"
+    "— не оскорбляешь по-настоящему (нация, раса, религия, ориентация, внешность, болезни).\n\n"
+    "Тон: дружелюбный, живой, с юмором. Влезаешь в разговор, как будто тебе и правда "
+    "интересно: где-то подколол, где-то поддержал, где-то кинул короткий коммент.\n\n"
+    "Если по последним сообщениям тебе реально нечего добавить или это совсем не твоя "
+    "тема — ответь ровно SKIP (это слово увидит только система, в чат оно не попадёт). "
+    "Лучше промолчать, чем сказать ерунду."
+)
+
+
+def tg(method, **payload):
+    try:
+        r = requests.post(f"{TG_API}/{method}", json=payload, timeout=15)
+        if not r.ok:
+            log.warning("TG %s failed [%s]: %s", method, r.status_code, r.text)
+        return r.json() if r.ok else None
+    except requests.RequestException as e:
+        log.warning("TG %s exception: %s", method, e)
+        return None
+
+
+def send(chat_id, text, reply_to=None):
+    payload = {"chat_id": chat_id, "text": text}
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+    return tg("sendMessage", **payload)
+
+
+def send_typing(chat_id):
+    tg("sendChatAction", chat_id=chat_id, action="typing")
+
+
+def ensure_identity():
+    """Один раз узнаём свой id/username (нужно для детекта обращений)."""
+    global BOT_ID, BOT_USERNAME
+    if BOT_ID is not None:
+        return
+    me = tg("getMe")
+    if me and me.get("ok"):
+        BOT_ID = me["result"]["id"]
+        BOT_USERNAME = me["result"].get("username")
+        log.info("identity: @%s id=%s", BOT_USERNAME, BOT_ID)
+
+
+class ChatState:
+    def __init__(self):
+        self.messages = deque(maxlen=40)   # {"name", "text"}
+        self.last_reply = 0.0
+        self.reply_times = deque()          # таймстемпы отправленных реплик
+
+
+STATES = {}
+_logged_chats = set()
+
+
+def is_addressed(msg, text):
+    """Обращаются ли к боту: реплай на него, @username или имя в тексте."""
+    rt = msg.get("reply_to_message") or {}
+    if BOT_ID is not None and (rt.get("from") or {}).get("id") == BOT_ID:
+        return True
+    low = text.lower()
+    if BOT_USERNAME and ("@" + BOT_USERNAME.lower()) in low:
+        return True
+    for nm in NAME_TRIGGERS:
+        if re.search(r"(?<![0-9a-zA-Zа-яёА-ЯЁ])" + re.escape(nm) + r"(?![0-9a-zA-Zа-яёА-ЯЁ])", low):
+            return True
+    return False
+
+
+def decide(state, addressed, text):
+    """Решаем, отвечать ли. Возвращает (отвечать, позвали_лично)."""
+    now = time.time()
+    while state.reply_times and now - state.reply_times[0] > 86400:
+        state.reply_times.popleft()
+    replies_day = len(state.reply_times)
+    replies_hour = sum(1 for t in state.reply_times if now - t < 3600)
+
+    if replies_day >= MAX_REPLIES_PER_DAY:
+        return False, False
+
+    if addressed:
+        return True, True  # прямое обращение — игнорим кулдаун и часовой лимит
+
+    if now - state.last_reply < REPLY_COOLDOWN_SEC:
+        return False, False
+    if replies_hour >= MAX_REPLIES_PER_HOUR:
+        return False, False
+
+    p = CHATTINESS + (QUESTION_BOOST if "?" in text else 0.0)
+    return (random.random() < p), False
+
+
+def build_reply(state, forced):
+    """Зовём Haiku с маленьким окном контекста. None — если сказать нечего."""
+    if anthropic is None:
+        log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
+        return None
+
+    recent = list(state.messages)[-CONTEXT_WINDOW:]
+    transcript = "\n".join(f"{m['name']}: {m['text']}" for m in recent)
+
+    instr = "Сейчас твоя очередь. Ответь как " + BOT_NAME + " — коротко, по-человечески, в тему последних сообщений."
+    if forced:
+        instr += " Тебя позвали лично, поэтому обязательно ответь (не пиши SKIP)."
+    else:
+        instr += " Если добавить реально нечего или это не твоя тема — ответь ровно SKIP."
+
+    user = f"Последние сообщения в чате:\n\n{transcript}\n\n{instr}"
+    try:
+        resp = anthropic.messages.create(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            system=PERSONA,
+            messages=[{"role": "user", "content": user}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        log.exception("anthropic call failed")
+        return None
+
+
+def handle_update(update):
+    msg = update.get("message")
+    if not msg:
+        return
+    chat = msg.get("chat", {})
+    chat_id = chat.get("id")
+
+    if ALLOWED_CHAT_ID:
+        if str(chat_id) != ALLOWED_CHAT_ID:
+            return
+    else:
+        if chat_id not in _logged_chats:
+            _logged_chats.add(chat_id)
+            log.info("UNCONFIGURED chat detected: ALLOWED_CHAT_ID=%s  (type=%s)", chat_id, chat.get("type"))
+        return
+
+    user = msg.get("from") or {}
+    if user.get("is_bot"):
+        return
+    text = (msg.get("text") or "").strip()
+    if not text:
+        return
+    name = user.get("first_name") or user.get("username") or "Кто-то"
+
+    ensure_identity()
+
+    state = STATES.setdefault(chat_id, ChatState())
+    state.messages.append({"name": name, "text": text[:300]})
+
+    addressed = is_addressed(msg, text)
+    ok, forced = decide(state, addressed, text)
+    if not ok:
+        return
+
+    reply = build_reply(state, forced)
+    if not reply or reply.upper().startswith("SKIP"):
+        return
+
+    send_typing(chat_id)
+    time.sleep(min(len(reply) / 18.0 + 0.5, TYPING_MAX_SEC))
+    send(chat_id, reply, reply_to=msg.get("message_id") if forced else None)
+
+    now = time.time()
+    state.messages.append({"name": BOT_NAME, "text": reply})
+    state.last_reply = now
+    state.reply_times.append(now)
+    log.info("replied (forced=%s) chat=%s: %s", forced, chat_id, reply[:80])
+
+
+@app.post("/webhook/<secret>")
+def webhook(secret):
+    if not WEBHOOK_SECRET or secret != WEBHOOK_SECRET:
+        abort(403)
+    update = request.get_json(force=True, silent=True) or {}
+    try:
+        handle_update(update)
+    except Exception:
+        log.exception("handle_update failed")
+    return "ok"
+
+
+@app.get("/health")
+def health():
+    return "ok"
+
+
+@app.get("/")
+def index():
+    return "zheka is alive"
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
