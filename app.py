@@ -60,6 +60,15 @@ OPINION_TRIGGERS = [s.strip().lower() for s in os.environ.get(
     "что думаешь,чё думаешь,че думаешь,как думаешь,твоё мнение,твое мнение,как считаешь,"
     "что скажешь,а ты как,а ты что,а ты чё,как тебе такое,что думаете,а ты чё молчишь,"
     "а ты че молчишь,ты согласен,а по-твоему").split(",") if s.strip()]
+
+# --- память чата (Supabase): любимые эмодзи и фразочки/мемы ---
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY", "")
+MEMORY_TABLE = os.environ.get("MEMORY_TABLE", "zheka_memory")
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_SECRET_KEY)
+MEMORY_FLUSH_EVERY = int(os.environ.get("MEMORY_FLUSH_EVERY", "8"))
+TOP_EMOJIS = int(os.environ.get("TOP_EMOJIS", "8"))
+TOP_PHRASES = int(os.environ.get("TOP_PHRASES", "6"))
 TYPING_MAX_SEC = float(os.environ.get("TYPING_MAX_SEC", "3.0"))
 
 # эмодзи, которые Telegram принимает как реакции (setMessageReaction).
@@ -152,6 +161,99 @@ def set_reaction(chat_id, message_id, emoji):
        reaction=[{"type": "emoji", "emoji": emoji}])
 
 
+# ---------- ПАМЯТЬ ЧАТА: эмодзи + фразочки (персист в Supabase) ----------
+EMOJI_RE = re.compile(
+    "[\U0001F1E6-\U0001F1FF\U0001F300-\U0001F5FF\U0001F600-\U0001F64F"
+    "\U0001F680-\U0001F6FF\U0001F780-\U0001F7FF\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF\U0001FA00-\U0001FAFF\U00002600-\U000026FF"
+    "\U00002700-\U000027BF\U00002B00-\U00002BFF\U00002190-\U000021FF\U00002328\U00002B50\U00002728]",
+    flags=re.UNICODE,
+)
+_EMOJI_MOD = set("️‍\U0001F3FB\U0001F3FC\U0001F3FD\U0001F3FE\U0001F3FF")
+
+MEM = {}        # chat_id -> {"emojis": {e: n}, "phrases": {p: n}}
+_MEM_LOADED = set()
+_MEM_DIRTY = {}  # chat_id -> сколько инкрементов с последнего сейва
+
+
+def _sb_headers():
+    return {"apikey": SUPABASE_SECRET_KEY, "Authorization": "Bearer " + SUPABASE_SECRET_KEY,
+            "Content-Type": "application/json"}
+
+
+def _mem_load(chat_id):
+    d = {"emojis": {}, "phrases": {}}
+    if not USE_SUPABASE:
+        return d
+    try:
+        r = requests.get(f"{SUPABASE_URL}/rest/v1/{MEMORY_TABLE}", headers=_sb_headers(),
+                         params={"chat_id": f"eq.{chat_id}", "select": "data"}, timeout=10)
+        if r.ok and r.json():
+            got = r.json()[0].get("data") or {}
+            d["emojis"] = got.get("emojis", {}) or {}
+            d["phrases"] = got.get("phrases", {}) or {}
+        elif not r.ok:
+            log.warning("memory load %s: %s", r.status_code, r.text[:150])
+    except Exception:
+        log.exception("memory load failed")
+    return d
+
+
+def _mem_save(chat_id):
+    if not USE_SUPABASE:
+        return
+    try:
+        r = requests.post(f"{SUPABASE_URL}/rest/v1/{MEMORY_TABLE}",
+                          headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"},
+                          params={"on_conflict": "chat_id"},
+                          json={"chat_id": str(chat_id), "data": MEM.get(chat_id, {})}, timeout=10)
+        if not r.ok:
+            log.warning("memory save %s: %s", r.status_code, r.text[:150])
+    except Exception:
+        log.exception("memory save failed")
+
+
+def _mem(chat_id):
+    if chat_id not in _MEM_LOADED:
+        MEM[chat_id] = _mem_load(chat_id)
+        _MEM_LOADED.add(chat_id)
+        _MEM_DIRTY[chat_id] = 0
+    return MEM[chat_id]
+
+
+def learn(chat_id, text):
+    """Запоминаем эмодзи и короткие повторяющиеся фразы из сообщения."""
+    m = _mem(chat_id)
+    changed = False
+    for c in EMOJI_RE.findall(text):
+        if c in _EMOJI_MOD:
+            continue
+        m["emojis"][c] = m["emojis"].get(c, 0) + 1
+        changed = True
+    norm = " ".join(text.strip().lower().split())
+    if norm and not norm.startswith("/") and 1 <= len(norm.split()) <= 5 and 2 <= len(norm) <= 40:
+        m["phrases"][norm] = m["phrases"].get(norm, 0) + 1
+        changed = True
+    if changed:
+        _MEM_DIRTY[chat_id] = _MEM_DIRTY.get(chat_id, 0) + 1
+        if _MEM_DIRTY[chat_id] >= MEMORY_FLUSH_EVERY:
+            _mem_save(chat_id)
+            _MEM_DIRTY[chat_id] = 0
+
+
+def memory_hint(chat_id):
+    """Подсказка для модели: любимые эмодзи и мемы чата."""
+    m = _mem(chat_id)
+    te = sorted(m["emojis"].items(), key=lambda x: -x[1])[:TOP_EMOJIS]
+    tp = [(p, c) for p, c in sorted(m["phrases"].items(), key=lambda x: -x[1]) if c >= 2][:TOP_PHRASES]
+    parts = []
+    if te:
+        parts.append("Эмодзи, которые любит этот чат: " + " ".join(e for e, _ in te))
+    if tp:
+        parts.append("Местные фразочки/мемы чата: " + ", ".join("«%s»" % p for p, _ in tp))
+    return "\n".join(parts)
+
+
 def ensure_identity():
     """Один раз узнаём свой id/username (нужно для детекта обращений)."""
     global BOT_ID, BOT_USERNAME
@@ -223,8 +325,8 @@ def decide(state, addressed, text):
     return (random.random() < p), False
 
 
-def build_reply(state, forced, opinion=False):
-    """Зовём Haiku. opinion=True → анализ обсуждения, больше контекста и длиннее ответ."""
+def build_reply(state, forced, opinion=False, hint=""):
+    """Зовём Haiku. opinion=True → анализ обсуждения; hint — стиль/эмодзи/мемы чата."""
     if anthropic is None:
         log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
         return None
@@ -254,6 +356,9 @@ def build_reply(state, forced, opinion=False):
 
     user = (f"История чата (контекст):\n{transcript}\n\n"
             f"ПОСЛЕДНЕЕ сообщение, на него и отвечай:\n{last['name']}: {last['text']}\n\n{instr}")
+    if hint:
+        user += ("\n\nПодсказка по стилю ЭТОГО чата (вплетай естественно, когда в тему, "
+                 "не насильно):\n" + hint)
     try:
         resp = anthropic.messages.create(
             model=MODEL,
@@ -295,6 +400,7 @@ def handle_update(update):
 
     state = STATES.setdefault(chat_id, ChatState())
     state.messages.append({"name": name, "text": text[:300]})
+    learn(chat_id, text)  # копим эмодзи/фразочки даже когда молчим
 
     addressed = is_addressed(msg, text)
     ok, forced = decide(state, addressed, text)
@@ -302,7 +408,7 @@ def handle_update(update):
         return
 
     opinion = any(t in text.lower() for t in OPINION_TRIGGERS)
-    raw = build_reply(state, forced, opinion)
+    raw = build_reply(state, forced, opinion, memory_hint(chat_id))
     if not raw:
         return
 
