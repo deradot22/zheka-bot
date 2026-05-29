@@ -306,8 +306,8 @@ def looks_directed(text):
 
 
 def decide(state, addressed, text, reply_to_other=False):
-    """Отвечать ли. Возвращает (отвечать, в_контексте).
-    в_контексте=True → прямое обращение или активная беседа: ответить по сути, не SKIP."""
+    """Возвращает (отвечать, в_контексте, judge).
+    judge=True → неоднозначный «ты» в беседе: пусть модель сама решит, к ней ли обращаются (иначе SKIP)."""
     now = time.time()
     while state.reply_times and now - state.reply_times[0] > 86400:
         state.reply_times.popleft()
@@ -315,37 +315,34 @@ def decide(state, addressed, text, reply_to_other=False):
     replies_hour = sum(1 for t in state.reply_times if now - t < 3600)
 
     if replies_day >= MAX_REPLIES_PER_DAY:
-        return False, False
+        return False, False, False
 
     # прямое обращение (имя / @ / реплай на бота) — всегда отвечаем
     if addressed:
-        return True, True
+        return True, True, False
 
-    # активная беседа: Жека недавно говорил → значит с ним общаются, держим нить
-    # и отвечаем почти на всё в контексте, мимо обычного кулдауна
+    # активная беседа: Гена недавно говорил → значит с ним общаются, держим нить
     if now < state.convo_until:
-        # «ты…» считаем обращением к НЕМУ, только если: это не реплай другому
-        # и голос Гены свежий в треде (он среди последних ~3 сообщений) —
-        # иначе «ты», скорее всего, адресовано другому участнику (Паше и т.п.)
         bot_recent = BOT_NAME in [m["name"] for m in list(state.messages)[-4:-1]]
         if looks_directed(text) and not reply_to_other and bot_recent:
-            return True, True
+            # «ты» может быть к нему или к другому (Паше) — пусть модель решит сама
+            return True, False, True
         if now - state.last_reply < CONVO_MIN_GAP:
-            return False, False
-        return (random.random() < CONVO_CHATTINESS), True
+            return False, False, False
+        return (random.random() < CONVO_CHATTINESS), True, False
 
     # фоновое встревание в чужой разговор — изредка и случайно
     if now - state.last_reply < REPLY_COOLDOWN_SEC:
-        return False, False
+        return False, False, False
     if replies_hour >= MAX_REPLIES_PER_HOUR:
-        return False, False
+        return False, False, False
 
     p = CHATTINESS + (QUESTION_BOOST if "?" in text else 0.0)
-    return (random.random() < p), False
+    return (random.random() < p), False, False
 
 
-def build_reply(state, forced, opinion=False, hint=""):
-    """Зовём Haiku. opinion=True → анализ обсуждения; hint — стиль/эмодзи/мемы чата."""
+def build_reply(state, forced, opinion=False, hint="", judge=False):
+    """Зовём Haiku. opinion=True → анализ обсуждения; hint — стиль/эмодзи/мемы; judge=True → модель сама решает, к ней ли обращались."""
     if anthropic is None:
         log.warning("no ANTHROPIC_API_KEY — cannot generate reply")
         return None
@@ -372,6 +369,10 @@ def build_reply(state, forced, opinion=False, hint=""):
         instr += " Тебя позвали лично — обязательно ответь по делу, не пиши SKIP."
     else:
         instr += " Если по сути нечего сказать и реакция не просится — ответь ровно SKIP."
+    if judge:
+        instr += (" СНАЧАЛА определи, адресовано ли ПОСЛЕДНЕЕ сообщение именно тебе (Гене) "
+                  "или другому участнику (по контексту, именам и никам вроде «паша», «серёга», «миша»). "
+                  "Если обращаются НЕ к тебе — ответь ровно SKIP и больше ничего.")
 
     user = (f"История чата (контекст):\n{transcript}\n\n"
             f"ПОСЛЕДНЕЕ сообщение, на него и отвечай:\n{last['name']}: {last['text']}\n\n{instr}")
@@ -424,12 +425,12 @@ def handle_update(update):
     addressed = is_addressed(msg, text)
     rt = msg.get("reply_to_message") or {}
     reply_to_other = bool(rt) and (rt.get("from") or {}).get("id") != BOT_ID
-    ok, forced = decide(state, addressed, text, reply_to_other)
+    ok, forced, judge = decide(state, addressed, text, reply_to_other)
     if not ok:
         return
 
     opinion = any(t in text.lower() for t in OPINION_TRIGGERS)
-    raw = build_reply(state, forced, opinion, memory_hint(chat_id))
+    raw = build_reply(state, forced, opinion, memory_hint(chat_id), judge)
     if not raw:
         return
 
