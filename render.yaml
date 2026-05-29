@@ -52,3 +52,5 @@ services:
         value: "25"
       - key: OPINION_MAX_TOKENS
         value: "280"
+      - key: REACT_CHANCE
+        value: "0.4"
